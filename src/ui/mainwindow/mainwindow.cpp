@@ -12,6 +12,7 @@
 #include "ui/memory_tab/memorytab.h"
 #include "ui/processor_tab/processortab.h"
 #include "ui/profiler_tab/profilertab.h"
+#include "ui/reorder_tab/reordertab.h"
 #include "ui/theme/icon_manager.h"
 #include "ui_mainwindow.h"
 #include "utils/utils.h"
@@ -131,7 +132,6 @@ void MainWindow::setUpToolBar()
     QAction  *processorAction = new QAction("Processor", this);
     QAction  *runAction       = new QAction("Run", this);
     QAction  *pauseAction     = new QAction("Pause", this);
-    QAction  *debugAction     = new QAction("Debug Run", this);
     QAction  *stepAction      = new QAction("Step", this);
     QAction  *undoAction      = new QAction("Undo", this);
     QAction  *redoAction      = new QAction("Redo", this);
@@ -147,12 +147,10 @@ void MainWindow::setUpToolBar()
     undoAction->setIcon(IconManager::getInstance().getIcon(Icon::Undo));
     redoAction->setIcon(IconManager::getInstance().getIcon(Icon::Redo));
     stepAction->setIcon(IconManager::getInstance().getIcon(Icon::Step));
-    debugAction->setIcon(IconManager::getInstance().getIcon(Icon::Debug));
     // tooltips for accessibility
     processorAction->setToolTip("Processor settings");
     runAction->setToolTip("Run program");
     pauseAction->setToolTip("Pause execution");
-    debugAction->setToolTip("Start debug run");
     stepAction->setToolTip("Execute single step");
     undoAction->setToolTip("Undo last VM step");
     redoAction->setToolTip("Redo last VM step");
@@ -171,7 +169,6 @@ void MainWindow::setUpToolBar()
     spinboxAction->setDefaultWidget(spinbox);
     toolbar->addAction(processorAction);
     toolbar->addAction(runAction);
-    toolbar->addAction(debugAction);
     toolbar->addAction(spinboxAction);
     toolbar->addAction(pauseAction);
     toolbar->addAction(stepAction);
@@ -180,11 +177,10 @@ void MainWindow::setUpToolBar()
     toolbar->addAction(redoAction);
 
     connect(runAction, &QAction::triggered, this,
-            [this, processorAction, runAction, pauseAction, debugAction]()
+        [this, processorAction, runAction, pauseAction]()
             {
                 if (runAction->text() == "Run")
                 {
-                    debugAction->setDisabled(true);
                     processorAction->setDisabled(true);
                     pauseAction->setEnabled(true);
                     runAction->setText("Stop");
@@ -200,26 +196,6 @@ void MainWindow::setUpToolBar()
                     runAction->setToolTip("Run program");
                     m_processorManager->stop();
                 }
-            });
-
-    connect(debugAction, &QAction::triggered, this,
-            [this, processorAction, runAction, pauseAction, stepAction, undoAction, redoAction,
-             debugAction]()
-            {
-                debugAction->setDisabled(true);
-                processorAction->setDisabled(true);
-                // debug run starts paused, so the toolbar starts in the paused state
-                runAction->setText("Stop");
-                runAction->setIcon(IconManager::getInstance().getIcon(Icon::Stop));
-                runAction->setToolTip("Stop execution");
-                pauseAction->setEnabled(true);
-                pauseAction->setText("Resume");
-                pauseAction->setIcon(IconManager::getInstance().getIcon(Icon::Resume));
-                pauseAction->setToolTip("Resume execution");
-                stepAction->setEnabled(true);
-                undoAction->setEnabled(true);
-                redoAction->setEnabled(true);
-                this->run(true);
             });
 
     connect(processorAction, &QAction::triggered, this, &MainWindow::processorChangeDialog);
@@ -278,6 +254,7 @@ void MainWindow::setUpSidebar()
     m_sidebar->addItem(new QListWidgetItem(iconManager.getIcon(Icon::Cache), "Cache"));
     m_sidebar->addItem(new QListWidgetItem(iconManager.getIcon(Icon::Compiler), "Compiler"));
     m_sidebar->addItem(new QListWidgetItem(iconManager.getIcon(Icon::Profiler), "Profiler"));
+    m_sidebar->addItem(new QListWidgetItem(iconManager.getIcon(Icon::Compiler), "Reorder"));
     m_sidebar->setIconSize(QSize(20, 20));
     m_sidebar->setMinimumWidth(48);
     m_sidebar->setCurrentRow(0);
@@ -406,6 +383,34 @@ void MainWindow::setUpTabs()
     m_tabs[TabIndex::CacheTabIndex]     = new CacheTab(this, m_processorManager->getMemoryController());
     m_tabs[TabIndex::CompilerTabIndex]  = new CompilerTab(this);
     m_tabs[TabIndex::ProfilerTabIndex]  = new ProfilerTab(this, m_processorManager->getProfiler());
+
+    // the reorder tab works on the text in the editor and hands its result back through a signal
+    auto *reorderTab = new ReorderTab(this);
+    m_tabs[TabIndex::ReorderTabIndex] = reorderTab;
+    reorderTab->setSourceProvider(
+        [this]() -> std::string
+        {
+            auto *editorTab = dynamic_cast<EditorTab *>(m_tabs[TabIndex::EditorTabIndex]);
+            return editorTab ? editorTab->getRawText() : std::string();
+        });
+    connect(reorderTab, &ReorderTab::applyToEditorRequested, this,
+            [this](const QString &reorderedText)
+            {
+                if (m_executionState != ExecutionState::Stopped)
+                {
+                    QMessageBox::information(this, "Reorder",
+                                             "Stop the running program before replacing the code "
+                                             "in the editor.");
+                    return;
+                }
+                auto *editorTab = dynamic_cast<EditorTab *>(m_tabs[TabIndex::EditorTabIndex]);
+                if (editorTab)
+                {
+                    editorTab->setRawText(reorderedText);
+                    m_sidebar->setCurrentRow(TabIndex::EditorTabIndex);
+                }
+            });
+    updateReorderTabMode(m_processorManager->getProcessorType());
     // a little experiment
     connect(this, &MainWindow::processorChangedSignal,
             dynamic_cast<ProcessorTab *>(m_tabs[TabIndex::ProcessorTabIndex]),
@@ -417,6 +422,31 @@ void MainWindow::setUpTabs()
     m_stackedTabs->addWidget(m_tabs[TabIndex::CacheTabIndex]);
     m_stackedTabs->addWidget(m_tabs[TabIndex::CompilerTabIndex]);
     m_stackedTabs->addWidget(m_tabs[TabIndex::ProfilerTabIndex]);
+    m_stackedTabs->addWidget(m_tabs[TabIndex::ReorderTabIndex]);
+}
+
+void MainWindow::updateReorderTabMode(ProcessorType vmType)
+{
+    auto *reorderTab = dynamic_cast<ReorderTab *>(m_tabs[TabIndex::ReorderTabIndex]);
+    if (!reorderTab)
+    {
+        return;
+    }
+    // Only the pipelined processors say anything about forwarding; keep the user's choice for
+    // the single-cycle processor.
+    switch (vmType)
+    {
+        case ProcessorType::RV5Stage_NH_NF:
+        case ProcessorType::RV5Stage_H_NF:
+            reorderTab->setForwardingEnabled(false);
+            break;
+        case ProcessorType::RV5Stage_NH_F:
+        case ProcessorType::RV5Stage_H_F:
+            reorderTab->setForwardingEnabled(true);
+            break;
+        default:
+            break;
+    }
 }
 
 bool MainWindow::tryParseAndLoadProgram()
@@ -513,6 +543,7 @@ void MainWindow::processorChanged(const ProcessorType &vmType)
         cacheTab->changeMemoryController(m_processorManager->getMemoryController());
     }
     emit processorChangedSignal();
+    updateReorderTabMode(vmType);
 
     // well also have to change the processor design from here later
 }
@@ -606,7 +637,8 @@ void MainWindow::themeChangedSlot([[maybe_unused]] const QString &themeId)
 
     // sidebar icons
     static const std::array<Icon, toIndex(TabIndex::TabCount)> sidebarIcons = {
-        Icon::Editor, Icon::Memory, Icon::Processor, Icon::Cache, Icon::Compiler, Icon::Profiler};
+        Icon::Editor,   Icon::Memory,   Icon::Processor, Icon::Cache,
+        Icon::Compiler, Icon::Profiler, Icon::Compiler};
     for (int row = 0; row < m_sidebar->count(); ++row)
     {
         if (row < static_cast<int>(sidebarIcons.size()))

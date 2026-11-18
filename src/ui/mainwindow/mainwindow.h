@@ -33,6 +33,7 @@ class MainWindow : public QMainWindow
         CacheTabIndex,
         CompilerTabIndex,
         ProfilerTabIndex,
+        ReorderTabIndex,
         TabCount
     };
 
@@ -54,6 +55,7 @@ private:
     void setUpSidebar();
     void setUpMenubar();
     void setUpTabs();
+    void updateReorderTabMode(ProcessorType vmType);
     void toggleTheme(const QString &themeId);
     bool tryParseAndLoadProgram();
     void run(bool startPaused = false);
